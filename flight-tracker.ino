@@ -23,7 +23,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 const char* BBOX_BL_LAT = SECRET_BBOX_BL_LAT; // Bottom-Left Latitude
 const char* BBOX_BL_LON = SECRET_BBOX_BL_LON; // Bottom-Left Longitude
 const char* BBOX_TR_LAT = SECRET_BBOX_TR_LAT; // Top-Right Latitude
-const char* BBOX_TR_LON = SECRET_BBOX_BL_LON; // Top-Right Longitude
+const char* BBOX_TR_LON = SECRET_BBOX_TR_LON; // Top-Right Longitude
 
 // Global client for making secure web requests
 WiFiSSLClient client;
@@ -191,13 +191,10 @@ void fetchAndDisplayFlights() {
   lcd.setCursor(0, 1);
   lcd.print("flights...");
 
+  https://flight-radar1.p.rapidapi.com/flights/v2/list-in-boundary?south=-37.791337&west=144.654959&north=-37.706839&east=144.868011&limit=300&dataSource=ADSB%2CMLAT%2CFLARM%2CFAA%2CSATELLITE%2CUAT%2CSPIDERTRACKS%2CAUS%2COTHER_DATA_SOURCE%2CESTIMATED&service=PASSENGER%2CCARGO%2CMILITARY_AND_GOVERNMENT%2CBUSINESS_JETS%2CGENERAL_AVIATION%2CHELICOPTERS%2CLIGHTER_THAN_AIR%2CDRONES%2COTHER_SERVICE%2CNON_CATEGORIZED%2CGLIDERS%2CGROUND_VEHICLES&trafficType=ALL&stats=true
+
   String boundaryEndpoint =
-    String("/flights/v2/list-in-boundary?") +
-      "south=" + BBOX_BL_LAT +
-      "&west=" + BBOX_BL_LON +
-      "&north=" + BBOX_TR_LAT +
-      "&east=" + BBOX_TR_LON +
-      "&limit=10&dataSource=ADSB%2CMLAT%2CFLARM%2CFAA%2CSATELLITE%2CUAT%2CSPIDERTRACKS%2CAUS%2COTHER_DATA_SOURCE%2CESTIMATED&service=PASSENGER%2CCARGO%2CMILITARY_AND_GOVERNMENT%2CBUSINESS_JETS&trafficType=AIRBORNE_ONLY";
+    String("/flights/v2/list-in-boundary?") + "south=" + String(BBOX_BL_LAT) + "&west=" + String(BBOX_BL_LON) + "&north=" + String(BBOX_TR_LAT) + "&east=" + String(BBOX_TR_LON) + "&limit=10&dataSource=ADSB%2CMLAT%2CFLARM%2CFAA%2CSATELLITE%2CUAT%2CSPIDERTRACKS%2CAUS%2COTHER_DATA_SOURCE%2CESTIMATED&service=PASSENGER%2CCARGO%2CMILITARY_AND_GOVERNMENT%2CBUSINESS_JETS&trafficType=AIRBORNE_ONLY";
 
   String boundaryResponse = makeApiRequest(boundaryEndpoint);
 
