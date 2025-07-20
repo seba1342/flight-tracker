@@ -14,7 +14,7 @@ const char* API_KEY = SECRET_API_KEY;
 const char* API_HOST = SECRET_API_HOST;
 
 // --- Hardware Pin Configuration ---
-const int JOYSTICK_SW_PIN = 4;   // Joystick switch (press) pin
+const int BUTTON_PIN = 4;
 
 // --- LCD Configuration ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -41,8 +41,8 @@ void setup() {
   lcd.print("*--o--(_)--o--*");
   delay(1000);
 
-  // Configure the joystick switch pin
-  pinMode(JOYSTICK_SW_PIN, INPUT_PULLUP);
+  // Configure the button switch pin
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   // Connect to WiFi
   connectToWiFi();
@@ -54,10 +54,10 @@ void setup() {
 }
 
 void loop() {
-  if (digitalRead(JOYSTICK_SW_PIN) == LOW) {
+  if (digitalRead(BUTTON_PIN) == LOW) {
     delay(50); // Debounce
     fetchAndDisplayFlights();
-    while (digitalRead(JOYSTICK_SW_PIN) == LOW); // Wait for release
+    while (digitalRead(BUTTON_PIN) == LOW); // Wait for release
   }
 }
 
