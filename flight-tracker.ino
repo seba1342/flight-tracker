@@ -25,8 +25,15 @@ const char* BBOX_BL_LON = SECRET_BBOX_BL_LON; // Bottom-Left Longitude
 const char* BBOX_TR_LAT = SECRET_BBOX_TR_LAT; // Top-Right Latitude
 const char* BBOX_TR_LON = SECRET_BBOX_TR_LON; // Top-Right Longitude
 
-// Global client for making secure web requests
+// Global client for making secure web requests. It is kept connected between
+// requests: a fresh TCP+TLS handshake costs several seconds on the UNO R4,
+// which was most of the per-request delay.
 WiFiSSLClient client;
+
+// Bound on any single network stall so a hung socket can't freeze the board.
+const unsigned long HTTP_TIMEOUT_MS = 10000;
+// Cap on the captured body, to protect the R4's 32 KB of SRAM.
+const size_t MAX_RESPONSE_BYTES = 16384;
 
 void setup() {
   Serial.begin(9600);
@@ -62,8 +69,6 @@ void loop() {
 }
 
 void connectToWiFi() {
-  // lcd.clear();
-  // lcd.print("Connecting WiFi");
   Serial.println("Connecting to WiFi...");
 
   int status = WL_IDLE_STATUS;
@@ -71,8 +76,12 @@ void connectToWiFi() {
     Serial.print("Attempting to connect to SSID: ");
     Serial.println(WIFI_SSID);
     status = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    // wait 10 seconds for connection:
-    delay(10000);
+    // Poll instead of a fixed delay so setup returns as soon as we are online.
+    unsigned long attemptStart = millis();
+    while (status != WL_CONNECTED && millis() - attemptStart < 15000) {
+      delay(250);
+      status = WiFi.status();
+    }
   }
 
   Serial.println("WiFi Connected!");
@@ -80,41 +89,136 @@ void connectToWiFi() {
   Serial.println(WiFi.localIP());
 }
 
+// Opens the TLS connection once and reuses it across requests. Reconnects
+// automatically whenever the server (or idle timeout) has closed it.
+bool ensureApiConnection() {
+  if (client.connected()) return true;
+
+  client.stop();
+  client.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+
+  Serial.println("Connecting to API host...");
+  return client.connect(API_HOST, 443);
+}
+
+void appendBody(String& body, const uint8_t* buf, int n) {
+  size_t room = MAX_RESPONSE_BYTES - body.length();
+  if (n > (int)room) n = room;
+  if (n > 0) body.concat((const char*)buf, n);
+}
+
 // Helper function to make the API requests and get the JSON body
-String makeApiRequest(String endpoint) {
-  Serial.println("\nStarting request to: " + endpoint);
-  String responseBody = "";
+String makeApiRequest(const String& endpoint) {
+  unsigned long start = millis();
+  Serial.println("\nRequest: " + endpoint);
 
-  if (client.connect(API_HOST, 443)) {
-    Serial.println("Connected to server.");
-    client.println("GET " + endpoint + " HTTP/1.1");
-    client.println("Host: " + String(API_HOST));
-    client.println("X-RapidAPI-Key: " + String(API_KEY));
-    client.println("X-RapidAPI-Host: " + String(API_HOST));
-    client.println("Connection: close");
-    client.println();
+  String body;
+  body.reserve(4096); // Pre-allocate: per-byte += without reserve reallocs every byte.
 
-    while (client.connected()) {
-      String line = client.readStringUntil('\n');
-      if (line == "\r") {
-        Serial.println("Headers received.");
-        break;
-      }
-    }
-
-    while (client.available()) {
-      char c = client.read();
-      responseBody += c;
-    }
-    client.stop();
-    Serial.println("Connection closed.");
-  } else {
+  if (!ensureApiConnection()) {
     Serial.println("Connection to server failed!");
     lcd.clear();
     lcd.print("Connect failed");
-    delay(2000);
+    delay(1500);
+    return body;
   }
-  return responseBody;
+
+  client.print("GET ");
+  client.print(endpoint);
+  client.println(" HTTP/1.1");
+  client.print("Host: ");
+  client.println(API_HOST);
+  client.print("X-RapidAPI-Key: ");
+  client.println(API_KEY);
+  client.print("X-RapidAPI-Host: ");
+  client.println(API_HOST);
+  client.println("Connection: keep-alive");
+  client.println();
+
+  // --- Status line and headers ---
+  int statusCode = 0;
+  long contentLength = -1;
+  bool chunked = false;
+  bool keepAlive = true; // HTTP/1.1 default
+  bool headersDone = false;
+  unsigned long deadline = millis() + HTTP_TIMEOUT_MS;
+
+  while (client.connected() && millis() < deadline) {
+    String line = client.readStringUntil('\n');
+    if (line.length() == 0) break; // stalled
+    if (line == "\r") { headersDone = true; break; }
+
+    String lower = line;
+    lower.toLowerCase();
+    if (lower.startsWith("http/")) {
+      statusCode = lower.substring(9, 12).toInt();
+    } else if (lower.startsWith("content-length:")) {
+      contentLength = lower.substring(15).toInt();
+    } else if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0) {
+      chunked = true;
+    } else if (lower.startsWith("connection:") && lower.indexOf("close") >= 0) {
+      keepAlive = false;
+    }
+  }
+  Serial.println("HTTP " + String(statusCode));
+
+  // No length and not chunked: the only end-of-body signal is the server
+  // closing, so the socket can't be reused.
+  if (!chunked && contentLength < 0) keepAlive = false;
+
+  // --- Body ---
+  bool complete = headersDone;
+  deadline = millis() + HTTP_TIMEOUT_MS;
+  uint8_t buf[128];
+
+  if (complete && chunked) {
+    // Decode chunk framing so the connection stays reusable.
+    while (millis() < deadline) {
+      String sizeLine = client.readStringUntil('\n');
+      if (sizeLine.length() == 0) { complete = false; break; }
+      long chunkSize = strtol(sizeLine.c_str(), NULL, 16);
+      if (chunkSize <= 0) {
+        // Consume trailer lines so nothing is left for the next request.
+        while (client.connected()) {
+          String trailer = client.readStringUntil('\n');
+          if (trailer.length() == 0 || trailer == "\r") break;
+        }
+        break;
+      }
+      while (chunkSize > 0 && millis() < deadline) {
+        int avail = client.available();
+        if (avail <= 0) { delay(1); continue; }
+        int n = client.read(buf, min(avail, (int)sizeof(buf)));
+        if (n <= 0) { complete = false; break; }
+        appendBody(body, buf, n);
+        chunkSize -= n;
+      }
+      client.readStringUntil('\n'); // CRLF after each chunk
+    }
+  } else if (complete) {
+    while (millis() < deadline) {
+      if (contentLength >= 0 && (long)body.length() >= contentLength) break;
+      int avail = client.available();
+      if (avail <= 0) {
+        if (!client.connected()) break; // server closed the connection
+        delay(1);
+        continue;
+      }
+      int n = client.read(buf, min(avail, (int)sizeof(buf)));
+      if (n <= 0) break;
+      appendBody(body, buf, n);
+    }
+    if (contentLength >= 0 && (long)body.length() < contentLength) complete = false;
+  }
+
+  // Only keep the socket open if the whole response was consumed and the
+  // server agreed to keep-alive; anything else would corrupt the next read.
+  if (!(complete && keepAlive)) client.stop();
+
+  Serial.println("Body: " + String(body.length()) + " bytes in " + String(millis() - start) + "ms");
+  return body;
 }
 
 /**
@@ -184,14 +288,74 @@ String pluralize(String word, int count) {
   return word + (count <= 1 ? "" : "s");
 }
 
+// Extracts an airport code from a value that is either a string ("SYD")
+// or an object holding one ({"iata":"SYD"} / {"icao":"YSSY"}).
+String airportCode(JSONVar value) {
+  if (JSON.typeof(value) == "string") return (const char*)value;
+  if (JSON.typeof(value) == "object") {
+    if (JSON.typeof(value["iata"]) == "string") return (const char*)value["iata"];
+    if (JSON.typeof(value["icao"]) == "string") return (const char*)value["icao"];
+    if (JSON.typeof(value["code"]) == "string") return (const char*)value["code"];
+  }
+  return "";
+}
+
+// Builds the "AAA -> BBB" route straight from a boundary-list entry when the
+// data is already there, skipping the extra API call entirely. Returns ""
+// when the list data doesn't carry route info.
+String routeFromListEntry(JSONVar& flight) {
+  if (JSON.typeof(flight["route"]) == "string") {
+    String route = (const char*)flight["route"];
+    route.replace("⟶", "->");
+    return route;
+  }
+
+  String origin = airportCode(flight["origin"]);
+  String destination = airportCode(flight["destination"]);
+  if (origin.length() == 0 && JSON.typeof(flight["airport"]) == "object") {
+    origin = airportCode(flight["airport"]["origin"]);
+    destination = airportCode(flight["airport"]["destination"]);
+  }
+
+  if (origin.length() > 0 && destination.length() > 0) {
+    return origin + " -> " + destination;
+  }
+  return "";
+}
+
+// Fallback for when the boundary list doesn't include route info:
+// resolve the callsign via the search endpoint.
+String lookupRouteForCallsign(const String& callsign) {
+  String searchResponse = makeApiRequest("/flights/search?query=" + callsign + "&limit=10");
+  if (searchResponse.length() == 0) return "";
+
+  JSONVar searchResult = JSON.parse(searchResponse);
+  if (JSON.typeof(searchResult["results"]) == "undefined" || searchResult["results"].length() == 0) {
+    Serial.println("Search for " + callsign + " returned no results.");
+    return "";
+  }
+
+  for (int j = 0; j < searchResult["results"].length(); j++) {
+    JSONVar currentResult = searchResult["results"][j];
+
+    if (JSON.typeof(currentResult["detail"]) != "undefined" && String((const char*)currentResult["type"]) == "live") {
+      String route = (const char*)currentResult["detail"]["route"];
+      route.replace("⟶", "->");
+      Serial.println("Found live flight for " + callsign + ": " + route);
+      return route;
+    }
+  }
+
+  Serial.println("Could not find a 'live' entry for " + callsign);
+  return "";
+}
+
 void fetchAndDisplayFlights() {
   lcd.backlight();
   lcd.clear();
   lcd.print("Fetching nearby");
   lcd.setCursor(0, 1);
   lcd.print("flights...");
-
-  https://flight-radar1.p.rapidapi.com/flights/v2/list-in-boundary?south=-37.791337&west=144.654959&north=-37.706839&east=144.868011&limit=300&dataSource=ADSB%2CMLAT%2CFLARM%2CFAA%2CSATELLITE%2CUAT%2CSPIDERTRACKS%2CAUS%2COTHER_DATA_SOURCE%2CESTIMATED&service=PASSENGER%2CCARGO%2CMILITARY_AND_GOVERNMENT%2CBUSINESS_JETS%2CGENERAL_AVIATION%2CHELICOPTERS%2CLIGHTER_THAN_AIR%2CDRONES%2COTHER_SERVICE%2CNON_CATEGORIZED%2CGLIDERS%2CGROUND_VEHICLES&trafficType=ALL&stats=true
 
   String boundaryEndpoint =
     String("/flights/v2/list-in-boundary?") + "south=" + String(BBOX_BL_LAT) + "&west=" + String(BBOX_BL_LON) + "&north=" + String(BBOX_TR_LAT) + "&east=" + String(BBOX_TR_LON) + "&limit=10&dataSource=ADSB%2CMLAT%2CFLARM%2CFAA%2CSATELLITE%2CUAT%2CSPIDERTRACKS%2CAUS%2COTHER_DATA_SOURCE%2CESTIMATED&service=PASSENGER%2CCARGO%2CMILITARY_AND_GOVERNMENT%2CBUSINESS_JETS&trafficType=AIRBORNE_ONLY";
@@ -207,54 +371,38 @@ void fetchAndDisplayFlights() {
       Serial.println(" flightsList found. Getting details...");
 
       for (int i = 0; i < flightCount; i++) {
-        String callsign = (const char*) response["flightsList"][i]["callsign"];
+        JSONVar flight = response["flightsList"][i];
+        String callsign = (const char*)flight["callsign"];
         if (callsign == "" || callsign == "N/A") {
           Serial.println("Skipping flight with no callsign.");
           continue;
         }
 
-        lcd.clear();
-        String flightsFoundText = "Found " + String(flightCount) + pluralize(" flight", flightCount);
-        lcd.print(flightsFoundText);
-        lcd.setCursor(0, 1);
-        lcd.print("fetching info...");
+        // Dump the first entry once so the available fields can be seen in
+        // the Serial monitor (e.g. whether route/origin/destination came free).
+        if (i == 0) {
+          Serial.println("First entry: " + JSON.stringify(flight));
+        }
 
-        String searchEndpoint = "/flights/search?query=" + callsign + "&limit=10";
-        String searchResponse = makeApiRequest(searchEndpoint);
+        String route = routeFromListEntry(flight);
 
-        if (searchResponse.length() > 0) {
-          JSONVar searchResult = JSON.parse(searchResponse);
+        if (route.length() == 0) {
+          lcd.clear();
+          String flightsFoundText = "Found " + String(flightCount) + pluralize(" flight", flightCount);
+          lcd.print(flightsFoundText);
+          lcd.setCursor(0, 1);
+          lcd.print("fetching info...");
 
-          if (JSON.typeof(searchResult["results"]) != "undefined" && searchResult["results"].length() > 0) {
-            bool liveFlightFound = false;
-            for (int j = 0; j < searchResult["results"].length(); j++) {
-              JSONVar currentResult = searchResult["results"][j];
+          route = lookupRouteForCallsign(callsign);
+        }
 
-              if (JSON.typeof(currentResult["detail"]) != "undefined" && String((const char*)currentResult["type"]) == "live") {
-                Serial.println("Found live flight for " + callsign);
-                String route = (const char*) currentResult["detail"]["route"];
-                route.replace("⟶", "->");
-
-                Serial.println(route);
-
-                lcd.clear();
-                lcd.setCursor(0, 0);
-                lcd.print(callsign + ":");
-                lcd.setCursor(0, 1);
-                scrollText(route, 1, 15000);
-
-                liveFlightFound = true;
-                break;
-              }
-            }
-
-            if (!liveFlightFound) {
-              Serial.println("Could not find a 'live' entry for " + callsign);
-            }
-
-          } else {
-            Serial.println("Search for " + callsign + " returned no results.");
-          }
+        if (route.length() > 0) {
+          Serial.println(callsign + ": " + route);
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print(callsign + ":");
+          lcd.setCursor(0, 1);
+          scrollText(route, 1, 15000);
         }
       }
     } else {
